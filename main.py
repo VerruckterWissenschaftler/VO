@@ -56,9 +56,10 @@ def plot_estimated_trajectory(estimated_positions, estimated_timestamps, gt_posi
 if __name__ == "__main__":
     dataset_file = r"data\outdoor_forward\outdoor_forward_1_davis_with_gt"
     calib_file = r"data\outdoor_forward_calib_davis"
-    duration_seconds = 10.0  # Process only first N seconds
-    
-    vo_estimator = VOEstimator(dataset_file, calib_file, duration=duration_seconds, use_imu=False)
+    duration_seconds = None  # Process only first N seconds
+    start_time = 1540113194.61788
+
+    vo_estimator = VOEstimator(dataset_file, calib_file, duration=duration_seconds, use_imu=False, start_time=start_time)
     
     # Print time alignment information
     vo_estimator.data_manager.print_time_alignment_info()

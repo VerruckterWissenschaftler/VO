@@ -3,11 +3,11 @@ import logging
 import numpy as np
 from src.ConfigManager import ConfigManager
 from src.DataManager import DataManager
-from src.FeaturesFlow import detect_features, LK_optical_flow
+from src.FeaturesFlow import detect_features, LK_optical_flow, ORB_feature_matching
 from tqdm import tqdm
 
 class VOEstimator:
-    def __init__(self, dataset_path, calib_path, duration=None, use_imu=True):
+    def __init__(self, dataset_path, calib_path, duration=None, use_imu=True, start_time=None):
         """
         Initialize Visual Odometry Estimator.
         
@@ -29,7 +29,7 @@ class VOEstimator:
         self.curr_frame = None
         self.logger = logging.getLogger("VOEstimator")
         self.config_manager = ConfigManager(calib_path)
-        self.data_manager = DataManager(dataset_path, duration=duration, use_imu=use_imu)
+        self.data_manager = DataManager(dataset_path, duration=duration, use_imu=use_imu, start_time=start_time)
         pose, orientation = self.data_manager.get_first_init_groundtruth_pose()
         self.current_pose = pose
         self.current_orientation = orientation
@@ -87,7 +87,10 @@ class VOEstimator:
     def estimate_pose(self, p0_good, p1_good):
         E, mask, x0, x1 = self.derive_essential_matrix(p0_good, p1_good)
         _, R, t, mask_pose = cv2.recoverPose(E, x1, x0, focal=1.0, pp=(0, 0)) # pylint: disable=no-member
-        t = np.array(t).flatten()
+        t = np.array(t)
+        t = self.current_orientation @ t.astype(np.float64)
+        self.current_orientation = R @ self.current_orientation
+        t = t.flatten()
         return t
 
     def update_attitude(self, imu_data):
@@ -102,7 +105,8 @@ class VOEstimator:
             self.prev_frame = frame
             return
         self.curr_frame = frame
-        tracked = LK_optical_flow(self.prev_frame, self.curr_frame, self.p0)
+        # tracked = LK_optical_flow(self.prev_frame, self.curr_frame, self.p0)
+        tracked = ORB_feature_matching(self.prev_frame, self.curr_frame)
         self.prev_frame = self.curr_frame
         if tracked is None or len(tracked[1]) < 10:
             self.p0 = None

@@ -5,7 +5,7 @@ import os
 
 
 class DataManager:
-    def __init__(self, dataset_path, duration=None, use_imu=False):
+    def __init__(self, dataset_path, duration=float('inf'), use_imu=False, start_time=None):
         self.dataset_path = dataset_path
         self.duration = duration
         
@@ -18,12 +18,14 @@ class DataManager:
         # Use DavisCsvReader for image data (handles image decoding)
         self.image_reader = DavisCsvReader(os.path.join(dataset_path, "dvs-image_raw.csv"))
         
-        # Synchronize ground truth time with image start time
-        self._synchronize_groundtruth_time()
+        # Store the start time (reference time from image data or provided)
+        if start_time is not None:
+            self.start_time = start_time
+        else:
+            self.start_time = self.image_reader.df['Time'].min() if len(self.image_reader.df) > 0 else 0.0
         
         # Apply duration filter if specified
-        if self.duration is not None:
-            self._apply_duration_filter()
+        self._apply_duration_filter()
         
         # Build the event list
         self.events = self._build_event_list()
@@ -39,40 +41,29 @@ class DataManager:
             first_row["pose.position.y"],
             first_row["pose.position.z"]
         ])
-        init_orientation = np.array([
+
+        q = np.array([
             first_row["pose.orientation.x"],
             first_row["pose.orientation.y"],
             first_row["pose.orientation.z"],
             first_row["pose.orientation.w"]
-        ])
-        
-        return init_position, init_orientation
+        ]).astype(float)
 
-    def _synchronize_groundtruth_time(self):
-        """
-        Synchronize ground truth timestamps with image start time.
-        Adjusts GT timestamps to align with image data start time.
-        """
-        if len(self.gt_df) == 0 or len(self.image_reader.df) == 0:
-            return  # Nothing to synchronize
+        # unpack
+        x, y, z, w = q
+
+        norm = np.linalg.norm(q)
+        x, y, z, w = x/norm, y/norm, z/norm, w/norm
+
+        R = np.array([
+            [1 - 2*(y*y + z*z),     2*(x*y - z*w),     2*(x*z + y*w)],
+            [    2*(x*y + z*w), 1 - 2*(x*x + z*z),     2*(y*z - x*w)],
+            [    2*(x*z - y*w),     2*(y*z + x*w), 1 - 2*(x*x + y*y)]
+        ])
+
         
-        image_start_time = self.image_reader.df['Time'].min()
-        gt_start_time = self.gt_df['Time'].min()
-        
-        # Calculate time offset
-        time_offset = image_start_time - gt_start_time
-        
-        print(f"Time Synchronization:")
-        print(f"  Image start time:  {image_start_time:.6f}")
-        print(f"  GT start time:     {gt_start_time:.6f}")
-        print(f"  Time offset:       {time_offset:.6f}s")
-        
-        # Apply offset to ground truth timestamps
-        self.gt_df['Time'] = self.gt_df['Time'] + time_offset
-        
-        print(f"  GT adjusted to:    {self.gt_df['Time'].min():.6f}")
-        print()
-    
+        return init_position, R
+
     def _apply_duration_filter(self):
         """
         Filter data to only include events within duration from start.
@@ -80,8 +71,8 @@ class DataManager:
         [start_time, start_time + duration].
         Uses image start time as the reference point.
         """
-        # Use image start time as reference (GT is already synchronized)
-        start_time = self.image_reader.df['Time'].min()
+        # Use image start time as reference
+        start_time = self.start_time
         end_time = start_time + self.duration
         
         print(f"Applying duration filter: {self.duration}s")
@@ -104,7 +95,7 @@ class DataManager:
         ].reset_index(drop=True)
         print(f"Image events: {img_before} -> {len(self.image_reader.df)}")
         
-        # Filter ground truth data (already synchronized to image time)
+        # Filter ground truth data
         gt_before = len(self.gt_df)
         self.gt_df = self.gt_df[
             (self.gt_df['Time'] >= start_time) & 
@@ -174,7 +165,7 @@ class DataManager:
         Returns:
         --------
         timestamps : numpy array
-            Timestamps from ground truth data (synchronized with image timestamps)
+            Timestamps from ground truth data (original timestamps from dataset)
         positions : numpy array, shape (N, 3)
             [x, y, z] positions from ground truth
         orientations : numpy array, shape (N, 4)
@@ -182,7 +173,7 @@ class DataManager:
             
         Notes:
         ------
-        - Ground truth timestamps are automatically synchronized with image start time
+        - Ground truth timestamps are NOT adjusted/synchronized
         - When duration filter is applied, only GT within the time window is returned
         - If no ground truth data exists, returns empty arrays with correct shapes
         """
@@ -247,7 +238,6 @@ class DataManager:
             gt_start = self.gt_df['Time'].min()
             gt_end = self.gt_df['Time'].max()
             print(f"GT data:     [{gt_start:.6f}, {gt_end:.6f}]  ({gt_end - gt_start:.3f}s)")
-            print(f"\nNote: GT timestamps are synchronized with image start time")
         else:
             print("GT data:     No data")
         
