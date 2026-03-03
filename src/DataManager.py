@@ -9,11 +9,13 @@ class DataManager:
         self.dataset_path = dataset_path
         self.duration = duration
         
-        # Read IMU and ground truth data with pandas (they don't have image data)
+        # Read ground truth data first to determine time bounds
+        self.gt_df = pd.read_csv(os.path.join(dataset_path, "groundtruth-pose.csv"))
+        
+        # Read IMU data if requested
         self.imu_df = None
         if use_imu:
             self.imu_df = pd.read_csv(os.path.join(dataset_path, "dvs-imu.csv"))
-        self.gt_df = pd.read_csv(os.path.join(dataset_path, "groundtruth-pose.csv"))
         
         # Use DavisCsvReader for image data (handles image decoding)
         self.image_reader = DavisCsvReader(os.path.join(dataset_path, "dvs-image_raw.csv"))
@@ -23,6 +25,18 @@ class DataManager:
             self.start_time = start_time
         else:
             self.start_time = self.image_reader.df['Time'].min() if len(self.image_reader.df) > 0 else 0.0
+        
+        # Determine end time from ground truth
+        if len(self.gt_df) > 0:
+            gt_end_time = self.gt_df['Time'].max()
+            # Use the minimum of specified duration and ground truth end time
+            calculated_end_time = self.start_time + self.duration
+            self.end_time = min(calculated_end_time, gt_end_time)
+            print(f"Ground truth end time: {gt_end_time:.6f}")
+            print(f"Using end time: {self.end_time:.6f} (limited by {'GT' if self.end_time == gt_end_time else 'duration'})")
+        else:
+            self.end_time = self.start_time + self.duration
+            print("Warning: No ground truth data available")
         
         # Apply duration filter if specified
         self._apply_duration_filter()
@@ -66,16 +80,18 @@ class DataManager:
 
     def _apply_duration_filter(self):
         """
-        Filter data to only include events within duration from start.
+        Filter data to only include events within the time window.
         Filters IMU data, image data, and ground truth to the time window
-        [start_time, start_time + duration].
-        Uses image start time as the reference point.
+        [start_time, end_time].
+        End time is determined by the minimum of (start_time + duration) and 
+        the last ground truth timestamp.
         """
-        # Use image start time as reference
+        # Use precalculated end_time
         start_time = self.start_time
-        end_time = start_time + self.duration
+        end_time = self.end_time
         
-        print(f"Applying duration filter: {self.duration}s")
+        actual_duration = end_time - start_time
+        print(f"\nApplying time filter: {actual_duration:.3f}s")
         print(f"Time window: [{start_time:.6f}, {end_time:.6f}]")
         
         # Filter IMU data
