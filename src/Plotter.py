@@ -7,7 +7,8 @@ import cv2
 def plot_trajectory_with_time_slider(timestamps, positions, trajectory_label="Trajectory",
                                      gt_timestamps=None, gt_positions=None, gt_label="Ground Truth",
                                      plot_3d=False, orientations=None, gt_orientations=None,
-                                     ukf_timestamps=None, ukf_positions=None, ukf_label="UKF Filtered"):
+                                     ukf_timestamps=None, ukf_positions=None, ukf_euler=None,
+                                     ukf_label="UKF Filtered"):
     """
     Create an interactive trajectory plot with a time slider.
     
@@ -71,6 +72,7 @@ def plot_trajectory_with_time_slider(timestamps, positions, trajectory_label="Tr
 
     # Process UKF trajectory if provided
     ukf_available = False
+    ukf_euler_available = False
     if ukf_timestamps is not None and ukf_positions is not None:
         ukf_positions = np.array(ukf_positions)
         ukf_timestamps = np.array(ukf_timestamps)
@@ -78,6 +80,9 @@ def plot_trajectory_with_time_slider(timestamps, positions, trajectory_label="Tr
             ukf_timestamps_norm = ukf_timestamps - t_min
             ukf_available = True
             print(f"UKF trajectory: {len(ukf_positions)} poses")
+            if ukf_euler is not None and len(ukf_euler) == len(ukf_timestamps):
+                ukf_euler = np.array(ukf_euler)  # (N, 3) [roll, pitch, yaw] radians
+                ukf_euler_available = True
 
     def rotation_matrix_to_euler(R):
         """Convert rotation matrix to roll, pitch, yaw (in degrees)."""
@@ -196,7 +201,11 @@ def plot_trajectory_with_time_slider(timestamps, positions, trajectory_label="Tr
     def update(val):
         """Update plot based on slider value"""
         t = slider.val
-        
+        ukf_pos_3d = None
+        ukf_rpy_deg = None
+        gt_rpy = None
+        est_rpy = None
+
         # Find index for current time (estimated trajectory)
         idx = np.searchsorted(timestamps_norm, t)
         if idx == 0:
@@ -218,9 +227,8 @@ def plot_trajectory_with_time_slider(timestamps, positions, trajectory_label="Tr
             
             marker.set_data([pos[0]], [pos[1]])
             marker.set_3d_properties([pos[2]])
-            
+
             # Get orientation data if available
-            est_rpy = None
             if orientations_available and idx < len(orientations):
                 if orientations.shape[-1] == 4:  # Quaternion
                     est_rpy = quaternion_to_euler(orientations[idx])
@@ -251,7 +259,6 @@ def plot_trajectory_with_time_slider(timestamps, positions, trajectory_label="Tr
                     gt_marker.set_3d_properties([gt_pos[2]])
                 
                 # Get GT orientation data if available
-                gt_rpy = None
                 if gt_orientations_available and gt_idx < len(gt_orientations):
                     if gt_orientations.shape[-1] == 4:  # Quaternion
                         gt_rpy = quaternion_to_euler(gt_orientations[gt_idx])
@@ -259,6 +266,8 @@ def plot_trajectory_with_time_slider(timestamps, positions, trajectory_label="Tr
                         gt_rpy = rotation_matrix_to_euler(gt_orientations[gt_idx])
 
             # Update UKF trajectory if available (3D)
+            ukf_pos_3d = None
+            ukf_rpy_deg = None
             if ukf_available:
                 ukf_idx = np.searchsorted(ukf_timestamps_norm, t)
                 if ukf_idx == 0:
@@ -269,8 +278,13 @@ def plot_trajectory_with_time_slider(timestamps, positions, trajectory_label="Tr
                     ua = (t - ukf_timestamps_norm[ukf_idx - 1]) / (
                         ukf_timestamps_norm[ukf_idx] - ukf_timestamps_norm[ukf_idx - 1] + 1e-9)
                     ukf_pos_3d = (1 - ua) * ukf_positions[ukf_idx - 1] + ua * ukf_positions[ukf_idx]
+                    if ukf_euler_available:
+                        ukf_rpy_rad = (1 - ua) * ukf_euler[ukf_idx - 1] + ua * ukf_euler[ukf_idx]
+                        ukf_rpy_deg = np.degrees(ukf_rpy_rad)
                 else:
                     ukf_pos_3d = ukf_positions[-1]
+                    if ukf_euler_available:
+                        ukf_rpy_deg = np.degrees(ukf_euler[-1])
                 ukf_marker.set_data([ukf_pos_3d[0]], [ukf_pos_3d[1]])
                 ukf_marker.set_3d_properties([ukf_pos_3d[2]])
         else:
@@ -286,9 +300,8 @@ def plot_trajectory_with_time_slider(timestamps, positions, trajectory_label="Tr
                 pos = positions[-1]
             
             marker.set_data([pos[0]], [pos[1]])
-            
+
             # Get orientation data if available
-            est_rpy = None
             if orientations_available and idx < len(orientations):
                 if orientations.shape[-1] == 4:  # Quaternion
                     est_rpy = quaternion_to_euler(orientations[idx])
@@ -315,7 +328,6 @@ def plot_trajectory_with_time_slider(timestamps, positions, trajectory_label="Tr
                 gt_marker.set_data([gt_pos[0]], [gt_pos[1]])
 
                 # Get GT orientation data if available
-                gt_rpy = None
                 if gt_orientations_available and gt_idx < len(gt_orientations):
                     if gt_orientations.shape[-1] == 4:  # Quaternion
                         gt_rpy = quaternion_to_euler(gt_orientations[gt_idx])
@@ -335,42 +347,61 @@ def plot_trajectory_with_time_slider(timestamps, positions, trajectory_label="Tr
                     ukf_pos = ukf_positions[-1]
                 ukf_marker.set_data([ukf_pos[0]], [ukf_pos[1]])
 
-        # Update time text with positions and orientations
-        if gt_available:
-            if plot_3d and positions.shape[1] >= 3:
-                pos_error = np.linalg.norm(pos - gt_pos)
-                text_lines = [
-                    f'Time: {t:.2f}s',
-                    f'Est Pos: [{pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}]',
-                    f'GT  Pos: [{gt_pos[0]:.2f}, {gt_pos[1]:.2f}, {gt_pos[2]:.2f}]',
-                    f'Pos Error: {pos_error:.2f}m'
-                ]
+        # Build text overlay
+        text_lines = [f'Time: {t:.2f}s']
+
+        if plot_3d and positions.shape[1] >= 3:
+            # UKF block (most prominent when use_vo=False)
+            if ukf_pos_3d is not None:
+                text_lines.append(f'UKF Pos: [{ukf_pos_3d[0]:.2f}, {ukf_pos_3d[1]:.2f}, {ukf_pos_3d[2]:.2f}]')
+            if ukf_rpy_deg is not None:
+                text_lines.append(f'UKF RPY: [{ukf_rpy_deg[0]:.1f}°, {ukf_rpy_deg[1]:.1f}°, {ukf_rpy_deg[2]:.1f}°]')
+
+            if gt_available:
+                text_lines.append(f'GT  Pos: [{gt_pos[0]:.2f}, {gt_pos[1]:.2f}, {gt_pos[2]:.2f}]')
+                if gt_rpy is not None:
+                    text_lines.append(f'GT  RPY: [{gt_rpy[0]:.1f}°, {gt_rpy[1]:.1f}°, {gt_rpy[2]:.1f}°]')
+
+                if ukf_pos_3d is not None:
+                    text_lines.append(f'UKF Pos Err: {np.linalg.norm(ukf_pos_3d - gt_pos):.2f}m')
+                if ukf_rpy_deg is not None and gt_rpy is not None:
+                    ang_diff = ukf_rpy_deg - gt_rpy
+                    ang_diff = (ang_diff + 180) % 360 - 180  # wrap
+                    text_lines.append(f'UKF Ang Err: {np.linalg.norm(ang_diff):.1f}°')
+
+                # VO block (only meaningful when use_vo=True)
+                text_lines.append(f'Est Pos: [{pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}]')
+                text_lines.append(f'Est Pos Err: {np.linalg.norm(pos - gt_pos):.2f}m')
+                if est_rpy is not None:
+                    text_lines.append(f'Est RPY: [{est_rpy[0]:.1f}°, {est_rpy[1]:.1f}°, {est_rpy[2]:.1f}°]')
+                    if gt_rpy is not None:
+                        ang_e = np.linalg.norm(((est_rpy - gt_rpy) + 180) % 360 - 180)
+                        text_lines.append(f'Est Ang Err: {ang_e:.1f}°')
             else:
-                pos_error = np.linalg.norm(pos - gt_pos[:2])
-                text_lines = [
-                    f'Time: {t:.2f}s',
+                text_lines.append(f'Est Pos: [{pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}]')
+                if est_rpy is not None:
+                    text_lines.append(f'Est RPY: [{est_rpy[0]:.1f}°, {est_rpy[1]:.1f}°, {est_rpy[2]:.1f}°]')
+        else:
+            # 2D branch — keep existing compact display
+            if gt_available:
+                pos_error = np.linalg.norm(pos[:2] - gt_pos[:2])
+                text_lines += [
                     f'Est Pos: [{pos[0]:.2f}, {pos[1]:.2f}]',
                     f'GT  Pos: [{gt_pos[0]:.2f}, {gt_pos[1]:.2f}]',
-                    f'Pos Error: {pos_error:.2f}m'
+                    f'Pos Error: {pos_error:.2f}m',
                 ]
-            
-            # Add orientation information if available
-            if est_rpy is not None:
-                text_lines.append(f'Est RPY: [{est_rpy[0]:.1f}°, {est_rpy[1]:.1f}°, {est_rpy[2]:.1f}°]')
-            if gt_rpy is not None:
-                text_lines.append(f'GT  RPY: [{gt_rpy[0]:.1f}°, {gt_rpy[1]:.1f}°, {gt_rpy[2]:.1f}°]')
-            if est_rpy is not None and gt_rpy is not None:
-                ang_error = np.linalg.norm(est_rpy - gt_rpy)
-                text_lines.append(f'Ang Error: {ang_error:.1f}°')
-            
-            time_text.set_text('\n'.join(text_lines))
-        else:
-            text_lines = [f'Time: {t:.2f}s',
-                         f'Position: [{pos[0]:.2f}, {pos[1]:.2f}' + 
-                         (f', {pos[2]:.2f}]' if plot_3d and positions.shape[1] >= 3 else ']')]
-            if est_rpy is not None:
-                text_lines.append(f'RPY: [{est_rpy[0]:.1f}°, {est_rpy[1]:.1f}°, {est_rpy[2]:.1f}°]')
-            time_text.set_text('\n'.join(text_lines))
+                if est_rpy is not None:
+                    text_lines.append(f'Est RPY: [{est_rpy[0]:.1f}°, {est_rpy[1]:.1f}°, {est_rpy[2]:.1f}°]')
+                if gt_rpy is not None:
+                    text_lines.append(f'GT  RPY: [{gt_rpy[0]:.1f}°, {gt_rpy[1]:.1f}°, {gt_rpy[2]:.1f}°]')
+                if est_rpy is not None and gt_rpy is not None:
+                    text_lines.append(f'Ang Error: {np.linalg.norm(est_rpy - gt_rpy):.1f}°')
+            else:
+                text_lines.append(f'Pos: [{pos[0]:.2f}, {pos[1]:.2f}]')
+                if est_rpy is not None:
+                    text_lines.append(f'RPY: [{est_rpy[0]:.1f}°, {est_rpy[1]:.1f}°, {est_rpy[2]:.1f}°]')
+
+        time_text.set_text('\n'.join(text_lines))
         
         fig.canvas.draw_idle()
     

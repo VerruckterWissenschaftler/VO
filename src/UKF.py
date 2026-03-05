@@ -50,25 +50,30 @@ class UKF:
     Absolute position is accumulated externally as a cumulative sum of
     filtered per-frame shifts.
 
-    Predict: driven by body-frame gyro (angular velocity → Euler angles).
-             Velocity decays with a first-order damping term.
+    Predict: driven by body-frame gyro (orientation) + body-frame linear
+             acceleration (velocity). Gravity is removed internally using
+             the current sigma-point orientation and g_world = 9.81 m/s².
     Update:  VO-derived per-frame shift measurement:  z_hat = v * dt.
     ZUPT:    Zero-velocity update during static periods.
     """
 
+    _G = 9.81  # gravitational acceleration, m/s²
+
     def __init__(
         self,
-        process_noise_vel:   float = 1e-2,
-        process_noise_angle: float = 1e-3,
+        process_noise_vel:   float = 1e-4,   # (m/s)² per step — tuned to ~200 Hz IMU
+        process_noise_angle: float = 1e-5,   # rad² per step
         measurement_noise:   float = 0.5,
         initial_uncertainty: float = 1e-3,
-        velocity_tau:        float = 2.0,
+        vel_decay_rate:      float = 2.0,    # 1/s — velocity e-folding time = 0.5 s
     ):
         self.n = 6   # state dimension: [vx, vy, vz, roll, pitch, yaw]
         self.m = 3   # measurement dimension: shift [dx, dy, dz]
 
         self.x = np.zeros(self.n)
         self.P = np.eye(self.n) * initial_uncertainty
+
+        self.vel_decay_rate = vel_decay_rate
 
         self.Q = np.diag([
             process_noise_vel,   process_noise_vel,   process_noise_vel,
@@ -77,9 +82,6 @@ class UKF:
 
         # Shift measurement noise (in metres)
         self.R_meas = np.eye(self.m) * measurement_noise
-
-        # Velocity decay time-constant (s): exp(-dt / tau) per step
-        self._tau = velocity_tau
 
         # UKF scaling (Wan & van der Merwe 2000)
         self.alpha = 1e-3
@@ -100,23 +102,24 @@ class UKF:
         self.x[3:] = _rotation_to_euler_zyx(R) if R is not None else 0.0
         self.initialized = True
 
-    def predict(self, omega: np.ndarray, dt: float) -> None:
+    def predict(self, omega: np.ndarray, accel_body: np.ndarray, dt: float) -> None:
         """
-        Prediction step driven by body-frame angular velocity (gyro).
+        Prediction step driven by body-frame gyro and linear acceleration.
 
         Parameters
         ----------
-        omega : (3,) ndarray  — angular velocity [wx, wy, wz] in body frame, rad/s.
-        dt    : float         — time step in seconds.
+        omega      : (3,) ndarray  — angular velocity [wx, wy, wz] in body frame, rad/s.
+        accel_body : (3,) ndarray  — linear acceleration [ax, ay, az] in body frame, m/s².
+                                     Gravity is removed internally per sigma-point orientation.
+        dt         : float         — time step in seconds.
         """
         if not self.initialized or dt <= 0 or dt > 0.5:
             return
 
-        damping   = np.exp(-dt / self._tau)
         sigma_pts = self._sigma_points(self.x, self.P)
 
         propagated = np.array([
-            self._process_model(sp, omega, dt, damping)
+            self._process_model(sp, omega, accel_body, dt, self._G)
             for sp in sigma_pts
         ])
 
@@ -239,21 +242,29 @@ class UKF:
             )
         return x_mean
 
-    @staticmethod
     def _process_model(
-        x: np.ndarray, omega: np.ndarray, dt: float, damping: float
+        self, x: np.ndarray, omega: np.ndarray, accel_body: np.ndarray, dt: float, g: float
     ) -> np.ndarray:
         """
-        Process model: velocity decays with first-order damping;
-        Euler angles integrate from body-frame gyro rates.
+        Process model: velocity integrates from world-frame linear acceleration
+        (gravity removed using sigma-point orientation); Euler angles integrate
+        from body-frame gyro rates.
         """
         x_new = x.copy()
 
-        # Velocity decay (prevents drift when no VO correction)
-        x_new[:3] = x[:3] * damping
+        roll, pitch, yaw = x[3], x[4], x[5]
+        R = _euler_zyx_to_rotation(roll, pitch, yaw)
+
+        # Rotate body-frame acceleration to world frame and remove gravity
+        a_world = R @ accel_body
+        a_world[2] -= g  # world Z is up; IMU measures a_kin + g_reaction
+
+        # Velocity integration with exponential decay: v decays toward 0 when
+        # no VO measurement corrects it, preventing unbounded drift from accel bias.
+        decay = np.exp(-self.vel_decay_rate * dt)
+        x_new[:3] = x[:3] * decay + a_world * dt
 
         # Euler angle update from body-frame angular velocity
-        roll, pitch, yaw = x[3], x[4], x[5]
         wx, wy, wz = omega
         cr, sr = np.cos(roll), np.sin(roll)
         cp = np.cos(pitch)

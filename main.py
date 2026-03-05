@@ -1,13 +1,13 @@
 from src.VOEstimator import VOEstimator
 import numpy as np
 from src.Plotter import plot_trajectory_with_time_slider
-from src.Metrics import compute_ate, compute_rpe, print_metrics_table
+from src.Metrics import compute_ate, compute_rpe, compute_angle_error, print_metrics_table
 
 
 def plot_estimated_trajectory(
     vo_timestamps, vo_positions, vo_orientations,
     gt_timestamps=None, gt_positions=None, gt_orientations=None,
-    ukf_timestamps=None, ukf_positions=None,
+    ukf_timestamps=None, ukf_positions=None, ukf_euler=None,
 ):
     """
     Interactive trajectory plot with three lines:
@@ -30,6 +30,7 @@ def plot_estimated_trajectory(
 
     ukf_pos_arr = np.array(ukf_positions) if ukf_positions is not None and len(ukf_positions) > 0 else None
     ukf_ts_arr = np.array(ukf_timestamps) if ukf_timestamps is not None and len(ukf_timestamps) > 0 else None
+    ukf_euler_arr = np.array(ukf_euler) if ukf_euler is not None and len(ukf_euler) > 0 else None
 
     plot_3d = vo_positions.shape[1] >= 3
 
@@ -44,6 +45,7 @@ def plot_estimated_trajectory(
         gt_label="Ground Truth",
         ukf_timestamps=ukf_ts_arr,
         ukf_positions=ukf_pos_arr,
+        ukf_euler=ukf_euler_arr,
         ukf_label="UKF Filtered",
         plot_3d=plot_3d,
     )
@@ -56,9 +58,10 @@ if __name__ == "__main__":
     vo_estimator = VOEstimator(dataset_file, calib_file)
     vo_estimator.data_manager.print_time_alignment_info()
 
-    # Run VO — returns raw VO trajectory and UKF-filtered trajectory
+    # Run VO — returns VO, UKF, and GT trajectories all sampled at image-frame timestamps
     (vo_timestamps, vo_positions, vo_orientations,
-     ukf_timestamps, ukf_positions) = vo_estimator.run()
+     ukf_timestamps, ukf_positions, ukf_euler,
+     gt_frame_timestamps, gt_frame_positions, gt_frame_orientations) = vo_estimator.run()
 
     # Ground truth
     gt_timestamps, gt_positions, gt_orientations = (
@@ -67,10 +70,11 @@ if __name__ == "__main__":
 
     print(f"\nEstimated trajectory (VO):  {len(vo_positions)} poses")
     print(f"UKF filtered trajectory:    {len(ukf_positions)} poses")
-    print(f"Ground truth trajectory:    {len(gt_positions)} poses")
+    print(f"Ground truth trajectory:    {len(gt_positions)} poses (CSV)")
+    print(f"GT at image frames:         {len(gt_frame_positions)} poses (aligned)")
 
     # -------------------------------------------------------
-    # Trajectory metrics
+    # Trajectory metrics  (use full-resolution CSV GT for accuracy)
     # -------------------------------------------------------
     vo_ts_arr = np.array(vo_timestamps)
     gt_ts_arr = gt_timestamps
@@ -79,15 +83,16 @@ if __name__ == "__main__":
 
     print("\nComputing trajectory metrics...")
 
-    vo_ate = compute_ate(vo_ts_arr, vo_positions, vo_orientations,
-                         gt_ts_arr, gt_pos_arr, gt_ori_arr)
-    vo_rpe = compute_rpe(vo_ts_arr, vo_positions, vo_orientations,
-                         gt_ts_arr, gt_pos_arr, gt_ori_arr,
-                         delta=1, delta_unit="f")
+    vo_ate, vo_rpe = {}, {}
+    if vo_estimator.use_vo:
+        vo_ate = compute_ate(vo_ts_arr, vo_positions, vo_orientations,
+                             gt_ts_arr, gt_pos_arr, gt_ori_arr)
+        vo_rpe = compute_rpe(vo_ts_arr, vo_positions, vo_orientations,
+                             gt_ts_arr, gt_pos_arr, gt_ori_arr,
+                             delta=1, delta_unit="f")
 
-    ukf_ate, ukf_rpe = {}, {}
+    ukf_ate, ukf_rpe, ukf_angle_err = {}, {}, {}
     if len(ukf_positions) > 1:
-        # UKF uses identity orientations (orientation tracked externally)
         ukf_ori = np.tile(np.eye(3), (len(ukf_positions), 1, 1))
         ukf_ts_arr = np.array(ukf_timestamps)
         ukf_ate = compute_ate(ukf_ts_arr, ukf_positions, ukf_ori,
@@ -95,16 +100,19 @@ if __name__ == "__main__":
         ukf_rpe = compute_rpe(ukf_ts_arr, ukf_positions, ukf_ori,
                               gt_ts_arr, gt_pos_arr, gt_ori_arr,
                               delta=1, delta_unit="f")
+        if ukf_euler is not None and len(ukf_euler) > 1:
+            ukf_angle_err = compute_angle_error(ukf_ts_arr, ukf_euler,
+                                                gt_ts_arr, gt_ori_arr)
 
-    print_metrics_table(vo_ate, vo_rpe, ukf_ate, ukf_rpe)
+    print_metrics_table(vo_ate, vo_rpe, ukf_ate, ukf_rpe, ukf_angle_err)
 
     # -------------------------------------------------------
-    # GT height offset for plotting only
-    # (VO starts at init_height; shift GT Z so both start at the same value)
+    # GT height offset for plotting (use frame-aligned GT)
     # -------------------------------------------------------
-    gt_positions_plot = gt_positions.copy() if gt_positions is not None and len(gt_positions) > 0 else gt_positions
-    if (gt_positions_plot is not None and len(gt_positions_plot) > 0
-            and len(vo_positions) > 0
+    gt_positions_plot = gt_frame_positions.copy() if len(gt_frame_positions) > 0 else gt_frame_positions
+    gt_timestamps_plot = np.array(gt_frame_timestamps)
+    gt_orientations_plot = gt_frame_orientations
+    if (len(gt_positions_plot) > 0 and len(vo_positions) > 0
             and gt_positions_plot.shape[1] >= 3):
         gt_z_offset = float(vo_positions[0, 2]) - float(gt_positions_plot[0, 2])
         if abs(gt_z_offset) > 1e-4:
@@ -119,8 +127,9 @@ if __name__ == "__main__":
     plot_estimated_trajectory(
         vo_timestamps, vo_positions, vo_orientations,
         gt_positions=gt_positions_plot,
-        gt_timestamps=gt_timestamps,
-        gt_orientations=gt_orientations,
+        gt_timestamps=gt_timestamps_plot,
+        gt_orientations=gt_orientations_plot,
         ukf_timestamps=ukf_timestamps,
         ukf_positions=ukf_positions,
+        ukf_euler=ukf_euler,
     )

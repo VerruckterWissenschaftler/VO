@@ -19,6 +19,7 @@ The entry point is `main.py`. Dataset path and calibration path are hardcoded at
 | Key | Effect |
 |-----|--------|
 | `use_imu` | Process IMU events (angular velocity for orientation, linear acceleration for UKF/height) |
+| `use_vo` | Enable visual odometry; `False` = IMU-only mode (UKF trajectory from accelerometer only) |
 | `start_time` | Absolute timestamp to begin processing |
 | `duration` | Seconds of data to process (capped by GT end time) |
 | `show_frames` | Open an OpenCV window showing tracked features during processing |

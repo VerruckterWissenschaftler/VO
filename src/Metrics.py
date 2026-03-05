@@ -109,7 +109,11 @@ def compute_ate(
     )
 
     traj_ref, traj_est = sync.associate_trajectories(traj_ref, traj_est)
-    traj_est.align(traj_ref, correct_scale=correct_scale)
+    try:
+        traj_est.align(traj_ref, correct_scale=correct_scale)
+    except Exception as e:  # GeometryException (degenerate trajectory)
+        logger.warning("Trajectory alignment failed (%s) — skipping ATE.", e)
+        return {}
 
     ate_metric = metrics.APE(metrics.PoseRelation.translation_part)
     ate_metric.process_data((traj_ref, traj_est))
@@ -184,13 +188,60 @@ def compute_rpe(
     return rpe_metric.get_all_statistics()
 
 
+def compute_angle_error(
+    est_timestamps: np.ndarray,
+    est_euler_rad: np.ndarray,
+    gt_timestamps: np.ndarray,
+    gt_orientations: np.ndarray,
+) -> dict:
+    """
+    Compute RMSE and mean angle error between estimated euler angles and GT quaternions.
+
+    Parameters
+    ----------
+    est_timestamps : (N,) seconds
+    est_euler_rad  : (N, 3) [roll, pitch, yaw] in radians
+    gt_timestamps  : (M,) seconds
+    gt_orientations: (M, 4) quaternions [x,y,z,w]
+
+    Returns
+    -------
+    dict with keys: rmse, mean  (degrees)
+    """
+    if len(est_euler_rad) < 2 or len(gt_orientations) < 2:
+        return {}
+
+    def _quat_xyzw_to_euler(q):
+        """[x,y,z,w] → [roll, pitch, yaw] in radians."""
+        x, y, z, w = q
+        roll  = np.arctan2(2*(w*x + y*z), 1 - 2*(x**2 + y**2))
+        sinp  = 2*(w*y - z*x)
+        pitch = np.arcsin(np.clip(sinp, -1, 1))
+        yaw   = np.arctan2(2*(w*z + x*y), 1 - 2*(y**2 + z**2))
+        return np.array([roll, pitch, yaw])
+
+    errors = []
+    for i, t in enumerate(est_timestamps):
+        gt_idx = int(np.argmin(np.abs(gt_timestamps - t)))
+        gt_euler = _quat_xyzw_to_euler(gt_orientations[gt_idx])
+        diff = est_euler_rad[i] - gt_euler
+        # Wrap each angle diff to [-pi, pi]
+        diff = (diff + np.pi) % (2 * np.pi) - np.pi
+        errors.append(np.linalg.norm(np.degrees(diff)))
+
+    errors = np.array(errors)
+    return {"rmse": float(np.sqrt(np.mean(errors**2))), "mean": float(np.mean(errors))}
+
+
 def print_metrics_table(
     vo_ate: dict, vo_rpe: dict,
     ukf_ate: dict | None = None, ukf_rpe: dict | None = None,
+    ukf_angle_error: dict | None = None,
 ) -> None:
-    """Print a formatted comparison table of ATE and RPE metrics."""
+    """Print a formatted comparison table of ATE, RPE and angle error metrics."""
+    has_ukf = bool(ukf_ate or ukf_rpe or ukf_angle_error)
     header = f"{'Metric':<22} {'VO':>10}"
-    if ukf_ate:
+    if has_ukf:
         header += f" {'UKF':>10}"
     print("\n" + "=" * (len(header) + 2))
     print(" Trajectory Evaluation Metrics")
@@ -204,16 +255,24 @@ def print_metrics_table(
             line += f" {ukf_val:>10.4f}"
         print(line)
 
-    if vo_ate:
-        print("  ATE (m):")
-        _row("  RMSE",   vo_ate.get("rmse", float("nan")),   ukf_ate.get("rmse",   float("nan")) if ukf_ate else None)
-        _row("  Mean",   vo_ate.get("mean", float("nan")),   ukf_ate.get("mean",   float("nan")) if ukf_ate else None)
-        _row("  Median", vo_ate.get("median", float("nan")), ukf_ate.get("median", float("nan")) if ukf_ate else None)
-        _row("  Std",    vo_ate.get("std", float("nan")),    ukf_ate.get("std",    float("nan")) if ukf_ate else None)
+    def _nan():
+        return float("nan")
 
-    if vo_rpe:
+    if vo_ate or ukf_ate:
+        print("  ATE (m):")
+        _row("  RMSE",   vo_ate.get("rmse",   _nan()) if vo_ate else _nan(), ukf_ate.get("rmse",   _nan()) if ukf_ate else None)
+        _row("  Mean",   vo_ate.get("mean",   _nan()) if vo_ate else _nan(), ukf_ate.get("mean",   _nan()) if ukf_ate else None)
+        _row("  Median", vo_ate.get("median", _nan()) if vo_ate else _nan(), ukf_ate.get("median", _nan()) if ukf_ate else None)
+        _row("  Std",    vo_ate.get("std",    _nan()) if vo_ate else _nan(), ukf_ate.get("std",    _nan()) if ukf_ate else None)
+
+    if vo_rpe or ukf_rpe:
         print("  RPE (m, delta=1 frame):")
-        _row("  RMSE",  vo_rpe.get("rmse", float("nan")),   ukf_rpe.get("rmse",  float("nan")) if ukf_rpe else None)
-        _row("  Mean",  vo_rpe.get("mean", float("nan")),   ukf_rpe.get("mean",  float("nan")) if ukf_rpe else None)
+        _row("  RMSE",  vo_rpe.get("rmse", _nan()) if vo_rpe else _nan(), ukf_rpe.get("rmse", _nan()) if ukf_rpe else None)
+        _row("  Mean",  vo_rpe.get("mean", _nan()) if vo_rpe else _nan(), ukf_rpe.get("mean", _nan()) if ukf_rpe else None)
+
+    if ukf_angle_error:
+        print("  Angle Error (°):")
+        _row("  RMSE", _nan(), ukf_angle_error.get("rmse", _nan()))
+        _row("  Mean", _nan(), ukf_angle_error.get("mean", _nan()))
 
     print("=" * (len(header) + 2) + "\n")

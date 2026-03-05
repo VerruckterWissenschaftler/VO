@@ -26,6 +26,8 @@ class VOEstimator:
         params = self._load_dataset_params(dataset_path)
 
         self.use_imu = params.get("use_imu", True)
+        self.use_vo = params.get("use_vo", True)
+        self.use_ukf = params.get("use_ukf", True)
         start_time = params.get("start_time", None)
         duration = params.get("duration", float("inf"))
         self.show_frames = params.get("show_frames", False)
@@ -48,7 +50,7 @@ class VOEstimator:
             dataset_path, duration=duration, use_imu=self.use_imu, start_time=start_time
         )
         pose, orientation = self.data_manager.get_first_init_groundtruth_pose()
-        print(orientation)
+
         if self.init_height is not None:
             pose = pose.copy()
             self.logger.info(
@@ -77,14 +79,27 @@ class VOEstimator:
         # Height-based scale estimator
         self.height_estimator = HeightEstimator()
 
-        # UKF — 6-state shift filter: [vx, vy, vz, roll, pitch, yaw]
+        # UKF — 6-state filter: [vx, vy, vz, roll, pitch, yaw]
+        # Predict: IMU gyro (orientation) + linear accel (velocity)
+        # Update:  VO per-frame shift (sparse, ~20 Hz)
         self.ukf = UKF(
-            process_noise_vel=1e-2,
-            process_noise_angle=1e-3,
+            process_noise_vel=1e-4,    # per IMU step (~200 Hz) — keeps covariance sensible
+            process_noise_angle=1e-5,
             measurement_noise=0.5,
+            vel_decay_rate=2.0,        # velocity e-folds in 0.5 s — prevents accel-bias runaway
         )
         self.ukf.initialize(orientation)
-        self.ukf_positions = {}  # timestamp → cumulative filtered position
+        self.ukf_positions = {}     # timestamp → cumulative filtered position
+        self.ukf_orientations = {}  # timestamp → [roll, pitch, yaw] radians
+        self.gt_positions_frames = {}   # timestamp → GT position at that image frame
+        self.gt_orientations_frames = {}  # timestamp → GT quaternion [x,y,z,w]
+
+        # Pre-extract GT arrays for fast per-frame lookup
+        gt_df = self.data_manager.gt_df
+        self._gt_times = gt_df["Time"].values.astype(np.float64) if len(gt_df) > 0 else np.empty(0)
+        self._gt_pos   = gt_df[["pose.position.x", "pose.position.y", "pose.position.z"]].values if len(gt_df) > 0 else np.empty((0, 3))
+        self._gt_quat  = gt_df[["pose.orientation.x", "pose.orientation.y",
+                                 "pose.orientation.z", "pose.orientation.w"]].values if len(gt_df) > 0 else np.empty((0, 4))
 
         # Matcher function (lazy-loaded GPU models via get_matcher)
         self._matcher = get_matcher(self.matcher_name)
@@ -94,6 +109,13 @@ class VOEstimator:
     # ------------------------------------------------------------------
     # Setup helpers
     # ------------------------------------------------------------------
+
+    def _lookup_gt_at(self, t: float):
+        """Return (position, quaternion) from GT closest to timestamp t."""
+        if len(self._gt_times) == 0:
+            return np.zeros(3), np.array([0., 0., 0., 1.])
+        idx = int(np.argmin(np.abs(self._gt_times - t)))
+        return self._gt_pos[idx].copy(), self._gt_quat[idx].copy()
 
     def _load_dataset_params(self, dataset_path):
         params_file = os.path.join(dataset_path, "params.yml")
@@ -154,7 +176,7 @@ class VOEstimator:
         # Current absolute rotation: prefer IMU, fall back to UKF, then stored
         if self.use_imu and self.imu_update_count > 0:
             R_curr = self.imu_orientation
-        elif self.ukf.initialized:
+        elif self.use_ukf and self.ukf.initialized:
             R_curr = self.ukf.get_rotation_matrix()
         else:
             R_curr = self.current_orientation
@@ -287,8 +309,12 @@ class VOEstimator:
         # Update height estimator
         self.height_estimator.update_imu(a_body, R_world, dt)
 
-        # UKF prediction step (gyro-only — avoids linear acceleration drift)
-        self.ukf.predict(omega, dt)
+        # UKF prediction step: gyro (orientation) + linear acceleration (velocity)
+        if self.use_ukf:
+            self.ukf.predict(omega, a_body, dt)
+            # IMU-only mode: accumulate UKF position at IMU rate (more accurate than per-frame)
+            if not self.use_vo and self.ukf.initialized:
+                self._ukf_cumulative_position += self.ukf.get_filtered_shift(dt)
 
     # ------------------------------------------------------------------
     # Per-frame update
@@ -321,16 +347,17 @@ class VOEstimator:
         if self._is_static(p0_good, p1_good):
             # Camera is stationary — skip VO and apply zero-velocity constraint
             self.shift = np.zeros(3)
-            self.ukf.zupt_update()
+            if self.use_ukf:
+                self.ukf.zupt_update()
         else:
             self.shift = self.estimate_pose(p0_good, p1_good)
+            self.shift /= 1e1
             self._cumulative_position = self._cumulative_position + self.shift
-            # UKF filters the per-frame shift (not absolute position)
-            if dt > 0:
+            if self.use_ukf and dt > 0:
                 self.ukf.update(self.shift, dt)
 
         # Accumulate UKF trajectory externally from filtered shift
-        if dt > 0 and self.ukf.initialized:
+        if self.use_ukf and dt > 0 and self.ukf.initialized:
             self._ukf_cumulative_position += self.ukf.get_filtered_shift(dt)
 
         if self.show_frames:
@@ -380,10 +407,17 @@ class VOEstimator:
         # UKF trajectory (stored incrementally in self.ukf_positions)
         ukf_times = sorted(self.ukf_positions.keys())
         ukf_positions = np.array([self.ukf_positions[t] for t in ukf_times]) if ukf_times else np.empty((0, 3))
+        ukf_euler = np.array([self.ukf_orientations.get(t, np.zeros(3)) for t in ukf_times]) if ukf_times else np.empty((0, 3))
+
+        # GT sampled at image-frame timestamps (aligned with VO/UKF)
+        gt_frame_times = sorted(self.gt_positions_frames.keys())
+        gt_frame_positions = np.array([self.gt_positions_frames[t] for t in gt_frame_times]) if gt_frame_times else np.empty((0, 3))
+        gt_frame_orientations = np.array([self.gt_orientations_frames[t] for t in gt_frame_times]) if gt_frame_times else np.empty((0, 4))
 
         return (
             sorted_times, vo_trajectory, vo_orientations,
-            ukf_times, ukf_positions,
+            ukf_times, ukf_positions, ukf_euler,
+            gt_frame_times, gt_frame_positions, gt_frame_orientations,
         )
 
     # ------------------------------------------------------------------
@@ -408,13 +442,20 @@ class VOEstimator:
                 event_time = event["time"]
 
                 if event_type == "image":
-                    self.update(event["data"]["image"], event_time=event_time)
+                    if self.use_vo:
+                        self.update(event["data"]["image"], event_time=event_time)
                     if self.shift is None:
                         self.shift = np.zeros(3)
-                    self.shifts[event_time] = self.shift
+                    self.shifts[event_time] = self.shift if self.use_vo else np.zeros(3)
                     self.orientations[event_time] = self.current_orientation.copy()
-                    # Snapshot UKF position at every image frame
-                    self.ukf_positions[event_time] = self._ukf_cumulative_position.copy()
+                    # Snapshot UKF state at every image frame
+                    if self.use_ukf:
+                        self.ukf_positions[event_time] = self._ukf_cumulative_position.copy()
+                        self.ukf_orientations[event_time] = self.ukf.x[3:].copy()  # [roll, pitch, yaw]
+                    # Snapshot nearest GT at this image frame (aligned timestamps)
+                    gt_p, gt_q = self._lookup_gt_at(event_time)
+                    self.gt_positions_frames[event_time] = gt_p
+                    self.gt_orientations_frames[event_time] = gt_q
 
                 elif event_type == "imu":
                     self.update_attitude(event)
