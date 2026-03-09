@@ -1,7 +1,5 @@
 import cv2
 import numpy as np
-import torch
-from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
@@ -161,123 +159,6 @@ def SIFT_feature_matching(frame1, frame2, max_features=2000, match_ratio=0.75, u
     p2 = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
     return (p1, p2)
 
-
-# ---------------------------------------------------------------------------
-# GPU matchers — loaded lazily (models cached after first call)
-# ---------------------------------------------------------------------------
-
-_lightglue_cache: dict = {}   # device → (extractor, matcher)
-_loftr_cache: dict = {}       # device → matcher
-
-
-def LightGlue_matching(
-    frame1: np.ndarray,
-    frame2: np.ndarray,
-    max_features: int = 2048,
-    device: str | None = None,
-):
-    """
-    LightGlue feature matching using SuperPoint keypoints.
-
-    Requires: pip install git+https://github.com/cvg/LightGlue.git
-
-    Parameters
-    ----------
-    frame1, frame2 : uint8 grayscale images (H, W)
-    max_features   : maximum SuperPoint keypoints per image
-    device         : 'cuda' / 'cpu' / None (auto-detect)
-
-    Returns
-    -------
-    (p1, p2) arrays of shape (N, 1, 2) or None if insufficient matches.
-    """
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    global _lightglue_cache
-    if device not in _lightglue_cache:
-        from lightglue import LightGlue, SuperPoint  # lazy import
-        extractor = SuperPoint(max_num_keypoints=max_features).eval().to(device)
-        matcher = LightGlue(features="superpoint").eval().to(device)
-        _lightglue_cache[device] = (extractor, matcher)
-
-    extractor, matcher = _lightglue_cache[device]
-
-    # Prepare tensors: float32 [0,1], shape [1, 1, H, W]
-    def _to_tensor(img):
-        return torch.from_numpy(img.astype(np.float32) / 255.0)[None, None].to(device)
-
-    img0, img1 = _to_tensor(frame1), _to_tensor(frame2)
-
-    with torch.no_grad():
-        feats0 = extractor.extract(img0)
-        feats1 = extractor.extract(img1)
-        result = matcher({"image0": feats0, "image1": feats1})
-
-    # Remove batch dimension
-    from lightglue.utils import rbd
-    feats0, feats1, result = rbd(feats0), rbd(feats1), rbd(result)
-
-    kpts0 = feats0["keypoints"].cpu().numpy()   # (N, 2)
-    kpts1 = feats1["keypoints"].cpu().numpy()   # (M, 2)
-    matches = result["matches"].cpu().numpy()   # (K, 2)
-
-    if len(matches) < 8:
-        return None
-
-    p1 = kpts0[matches[:, 0]].reshape(-1, 1, 2).astype(np.float32)
-    p2 = kpts1[matches[:, 1]].reshape(-1, 1, 2).astype(np.float32)
-    return (p1, p2)
-
-
-def LOFTR_matching(
-    frame1: np.ndarray,
-    frame2: np.ndarray,
-    device: str | None = None,
-):
-    """
-    LoFTR detector-free dense feature matching via kornia.
-
-    Requires: pip install kornia
-
-    Parameters
-    ----------
-    frame1, frame2 : uint8 grayscale images (H, W)
-    device         : 'cuda' / 'cpu' / None (auto-detect)
-
-    Returns
-    -------
-    (p1, p2) arrays of shape (N, 1, 2) or None if insufficient matches.
-    """
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    global _loftr_cache
-    if device not in _loftr_cache:
-        import kornia.feature as KF  # lazy import
-        _loftr_cache[device] = KF.LoFTR(pretrained="outdoor").eval().to(device)
-
-    loftr = _loftr_cache[device]
-
-    def _to_tensor(img):
-        return torch.from_numpy(img.astype(np.float32) / 255.0)[None, None].to(device)
-
-    img0, img1 = _to_tensor(frame1), _to_tensor(frame2)
-
-    with torch.no_grad():
-        out = loftr({"image0": img0, "image1": img1})
-
-    kpts0 = out["keypoints0"].cpu().numpy()  # (M, 2)
-    kpts1 = out["keypoints1"].cpu().numpy()  # (M, 2)
-
-    if len(kpts0) < 8:
-        return None
-
-    p1 = kpts0.reshape(-1, 1, 2).astype(np.float32)
-    p2 = kpts1.reshape(-1, 1, 2).astype(np.float32)
-    return (p1, p2)
-
-
 # ---------------------------------------------------------------------------
 # Matcher selector
 # ---------------------------------------------------------------------------
@@ -302,8 +183,4 @@ def get_matcher(name: str = "sift"):
         return StatefulTracker(detector="orb", max_features=2000, min_tracked=200)
     if name_lower == "lk":
         return StatefulTracker(detector="shi-tomasi", max_features=1000, min_tracked=200)
-    if name_lower == "lightglue":
-        return LightGlue_matching
-    if name_lower == "loftr":
-        return LOFTR_matching
     raise ValueError(f"Unknown matcher '{name}'. Choose from: sift, orb, lk, lightglue, loftr")
