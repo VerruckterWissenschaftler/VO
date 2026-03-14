@@ -29,14 +29,13 @@ def _interp_cols(target_t: np.ndarray, src_t: np.ndarray,
 # ──────────────────────────────────────────────────────────────────────────────
 # UKFDebugger
 # ──────────────────────────────────────────────────────────────────────────────
-# State layout (12-state UKF):
-#   x = [px, py, pz,  vx, vy, vz,  roll, pitch, yaw,  wx, wy, wz]
-#         0   1   2    3   4   5    6     7      8     9  10  11
+# State layout (9-state UKF):
+#   x = [px, py, pz,  vx, vy, vz,  roll, pitch, yaw]
+#         0   1   2    3   4   5    6     7      8
 
-_POS   = slice(0, 3)
-_VEL   = slice(3, 6)
-_ANG   = slice(6, 9)
-_OMEGA = slice(9, 12)
+_POS = slice(0, 3)
+_VEL = slice(3, 6)
+_ANG = slice(6, 9)
 
 
 class UKFDebugger:
@@ -64,12 +63,11 @@ class UKFDebugger:
     def _attach(self):
         orig_predict    = self.ukf.predict
         orig_vo_update  = self.ukf.vo_update
-        orig_gyro       = self.ukf.gyro_update
         orig_append_ori = self.ukf.append_orientation
         dbg = self
 
-        def patched_predict(dt):
-            orig_predict(dt)
+        def patched_predict(omega, dt):
+            orig_predict(omega, dt)
             if dbg.ukf.initialized and dt > 0:
                 dbg._cumtime += dt
             dbg._record_predict()
@@ -81,24 +79,16 @@ class UKFDebugger:
             orig_vo_update(position)
             dbg._record_update(inn, 'vo')
 
-        def patched_gyro(omega_meas):
-            inn = np.zeros(3)
-            if dbg.ukf.initialized:
-                inn = omega_meas - dbg.ukf.x[_OMEGA]
-            orig_gyro(omega_meas)
-            dbg._record_update(inn, 'gyro')
-
         def patched_append_ori(R):
             orig_append_ori(R)
             dbg._record_update(np.zeros(3), 'ori')
 
-        self.ukf.predict           = patched_predict
-        self.ukf.vo_update         = patched_vo_update
-        self.ukf.gyro_update       = patched_gyro
+        self.ukf.predict            = patched_predict
+        self.ukf.vo_update          = patched_vo_update
         self.ukf.append_orientation = patched_append_ori
 
     def detach(self):
-        for name in ('predict', 'vo_update', 'gyro_update', 'append_orientation'):
+        for name in ('predict', 'vo_update', 'append_orientation'):
             try:
                 delattr(self.ukf, name)
             except AttributeError:
@@ -133,10 +123,9 @@ class UKFDebugger:
             print("UKFDebugger: no data recorded.")
             return
 
-        x_arr  = np.array([r['x'] for r in self._predict_log])
-        n_vo   = sum(1 for r in self._update_log if r['kind'] == 'vo')
-        n_gyro = sum(1 for r in self._update_log if r['kind'] == 'gyro')
-        n_ori  = sum(1 for r in self._update_log if r['kind'] == 'ori')
+        x_arr = np.array([r['x'] for r in self._predict_log])
+        n_vo  = sum(1 for r in self._update_log if r['kind'] == 'vo')
+        n_ori = sum(1 for r in self._update_log if r['kind'] == 'ori')
 
         groups = [
             ('Position (m)',        _POS,   ['px',    'py',    'pz'   ]),
@@ -150,7 +139,6 @@ class UKFDebugger:
         print(f"  Predict steps  : {len(self._predict_log)}")
         print(f"  Duration       : {self._cumtime:.2f} s")
         print(f"  VO updates     : {n_vo}")
-        print(f"  Gyro updates   : {n_gyro}")
         print(f"  Ori updates    : {n_ori}")
         for title, sl, names in groups:
             vals = x_arr[:, sl]
@@ -192,7 +180,7 @@ class UKFDebugger:
         n     = len(log)
         steps = np.arange(n)
 
-        x_arr  = np.array([r['x']       for r in log])   # (n, 12)
+        x_arr  = np.array([r['x']       for r in log])   # (n, 9)
         ct_arr = np.array([r['cumtime'] for r in log])   # (n,)
         a_arr  = np.array([r['a_world'] for r in log])   # (n, 3)
 

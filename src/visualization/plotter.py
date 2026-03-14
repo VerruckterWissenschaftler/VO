@@ -9,7 +9,8 @@ def plot_trajectory_with_time_slider(
     gt_timestamps=None, gt_positions=None, gt_label="Ground Truth",
     plot_3d=False, orientations=None, gt_orientations=None,
     ukf_timestamps=None, ukf_positions=None, ukf_euler=None, ukf_label="UKF Filtered",
-    frames=None, imu_timestamps=None, imu_accel=None,
+    vo_timestamps=None, vo_positions=None,
+    frames=None, frame_features=None, frame_foe=None, imu_timestamps=None, imu_accel=None,
     velocities=None,
 ):
     """
@@ -52,25 +53,20 @@ def plot_trajectory_with_time_slider(
             ukf_available = True
             print(f"UKF trajectory: {len(ukf_positions)} poses")
 
-    # ── Velocities ────────────────────────────────────────────────────────────
+    # ── VO (raw frame-estimated trajectory) ───────────────────────────────────
+    vo_available = False
+    vo_timestamps_norm = None
+    if vo_timestamps is not None and vo_positions is not None:
+        vo_positions   = np.array(vo_positions)
+        vo_timestamps  = np.array(vo_timestamps)
+        if len(vo_timestamps) > 0 and len(vo_positions) > 0:
+            vo_timestamps_norm = vo_timestamps - t_min
+            vo_available = True
+
+    # ── Velocities (kept for info panel only, no subplot) ─────────────────────
     velocities_available = velocities is not None and len(velocities) > 0
     if velocities_available:
         velocities = np.array(velocities)
-
-    # ── GT velocity (finite difference) ───────────────────────────────────────
-    gt_vel_available = False
-    gt_vel_times_norm = gt_vel_speed = None
-    if gt_available and len(gt_timestamps_norm) > 1:
-        dt_gt = np.diff(gt_timestamps_norm)
-        dt_gt = np.maximum(dt_gt, 1e-9)
-        gt_vel_xyz    = np.diff(gt_positions, axis=0) / dt_gt[:, None]
-        gt_vel_times_norm = gt_timestamps_norm[1:]
-        gt_vel_speed  = np.linalg.norm(gt_vel_xyz, axis=1)
-        gt_vel_available = True
-
-    # ── UKF speed (for velocity subplot) ─────────────────────────────────────
-    ukf_speed_available = velocities_available and ukf_available
-    ukf_speed = np.linalg.norm(velocities, axis=1) if ukf_speed_available else None
 
     # ── Frames ────────────────────────────────────────────────────────────────
     frames_available = False
@@ -116,9 +112,8 @@ def plot_trajectory_with_time_slider(
         next_rect   = [l_traj + 0.44, 0.04, 0.04, 0.03]
         button_rect = [l_traj + 0.49, 0.04, 0.08, 0.03]
 
-    panel_rect = [l_info,  0.11, w_info, 0.85]
-    traj_rect  = [l_traj,  0.40, w_traj, 0.56]
-    vel_rect   = [l_traj,  0.11, w_traj, 0.24]
+    panel_rect = [l_info, 0.11, w_info, 0.85]
+    traj_rect  = [l_traj, 0.11, w_traj, 0.85]
 
     # Info panel (left)
     ax_info = fig.add_axes(panel_rect)
@@ -134,41 +129,41 @@ def plot_trajectory_with_time_slider(
         fontfamily='monospace',
     )
 
-    # Trajectory axes (centre top)
+    # Trajectory axes (centre)
     ax = fig.add_axes(traj_rect, projection='3d') if is_3d else fig.add_axes(traj_rect)
-
-    # Velocity subplot (centre bottom)
-    ax_vel = fig.add_axes(vel_rect)
-    ax_vel.set_xlabel('time (s)', fontsize=8)
-    ax_vel.set_ylabel('speed (m/s)', fontsize=8)
-    ax_vel.set_title('Speed', fontsize=9, fontweight='bold')
-    ax_vel.tick_params(labelsize=7)
-    ax_vel.grid(True, linewidth=0.4)
 
     t_max = timestamps_norm.max()
 
-    if ukf_speed_available:
-        ax_vel.plot(ukf_timestamps_norm, ukf_speed,
-                    color='tab:orange', linewidth=1.0, alpha=0.8, label='UKF speed')
-    if gt_vel_available:
-        ax_vel.plot(gt_vel_times_norm, gt_vel_speed,
-                    color='tab:green', linewidth=1.0, alpha=0.8, linestyle='--', label='GT speed')
-    if ukf_speed_available or gt_vel_available:
-        ax_vel.legend(fontsize=7, loc='upper right')
-
-    vel_vline = ax_vel.axvline(0, color='red', linewidth=1.2, alpha=0.9)
-
-    # Frame panel (right, optional)
+    # Frame panel (right, optional) — top portion; direction arrows below
     _FRAME_W, _FRAME_H = 400, 300
 
     frame_img = None
+    _dir_axes = []
     if frames_available:
-        ax_frame = fig.add_axes([l_frm, 0.11, w_frm, 0.85])
+        ax_frame = fig.add_axes([l_frm, 0.38, w_frm, 0.58])
         ax_frame.axis('off')
         ax_frame.set_title('Camera Frame', fontsize=9)
         first = cv2.resize(frames[frame_times[0]], (_FRAME_W, _FRAME_H))  # pylint: disable=no-member
         cmap  = 'gray' if first.ndim == 2 else None
         frame_img = ax_frame.imshow(first, cmap=cmap, aspect='equal')
+
+        # Shift-per-axis bar charts (below frame) — X, Y, Z side by side
+        _shift_bar_axes = []   # list of (ax, bar_gt, bar_vo)
+        w3 = w_frm / 3
+        for i, (label_ax, left) in enumerate(
+            [('X shift (m)', l_frm), ('Y shift (m)', l_frm + w3), ('Z shift (m)', l_frm + 2*w3)]
+        ):
+            a = fig.add_axes([left, 0.11, w3 - 0.005, 0.24])
+            a.set_title(label_ax, fontsize=7)
+            a.set_xticks([0.2, 0.8])
+            a.set_xticklabels(['GT', 'VO'], fontsize=7)
+            a.tick_params(axis='y', labelsize=6)
+            a.axhline(0, color='#999999', lw=0.7)
+            a.set_xlim(0, 1)
+            a.grid(axis='y', linewidth=0.4, alpha=0.5)
+            bar_gt = a.bar([0.2], [0.0], width=0.25, color='tab:green', zorder=2)
+            bar_vo = a.bar([0.8], [0.0], width=0.25, color='tab:blue',  zorder=2)
+            _shift_bar_axes.append((a, bar_gt, bar_vo, i))
 
     # ── Plot full (faded) trajectories ────────────────────────────────────────
     if is_3d:
@@ -241,18 +236,18 @@ def plot_trajectory_with_time_slider(
             gt_pos, gt_idx = _interp(gt_timestamps_norm, gt_positions, t)
             gt_shift = gt_positions[gt_idx] - gt_positions[gt_idx - 1] if gt_idx > 0 else np.zeros(3)
 
-        # GT velocity at current time
-        gt_vel_cur = None
-        if gt_vel_available:
-            gi = int(np.clip(np.searchsorted(gt_vel_times_norm, t), 0, len(gt_vel_times_norm) - 1))
-            gt_vel_cur = float(gt_vel_speed[gi])
-
         # UKF
         ukf_pos = ukf_shift = None
         ukf_idx = 0
         if ukf_available:
             ukf_pos, ukf_idx = _interp(ukf_timestamps_norm, ukf_positions, t)
             ukf_shift = ukf_positions[ukf_idx] - ukf_positions[ukf_idx - 1] if ukf_idx > 0 else np.zeros(3)
+
+        # VO (raw frame estimate)
+        vo_shift = None
+        if vo_available:
+            _, vo_idx = _interp(vo_timestamps_norm, vo_positions, t)
+            vo_shift = vo_positions[vo_idx] - vo_positions[vo_idx - 1] if vo_idx > 0 else np.zeros(3)
 
         # ── Update trajectory lines ───────────────────────────────────────────
         if is_3d:
@@ -281,13 +276,40 @@ def plot_trajectory_with_time_slider(
                 ukf_traj_line.set_data(ukf_positions[:ukf_idx, 0], ukf_positions[:ukf_idx, 1])
                 ukf_marker.set_data([ukf_pos[0]], [ukf_pos[1]])
 
-        # ── Update velocity vline ─────────────────────────────────────────────
-        vel_vline.set_xdata([t, t])
-
         # ── Update frame panel ────────────────────────────────────────────────
         if frames_available and frame_img is not None:
             fi = int(np.clip(np.searchsorted(frame_times, t_abs), 0, len(frame_times) - 1))
-            frame_img.set_data(cv2.resize(frames[frame_times[fi]], (_FRAME_W, _FRAME_H)))  # pylint: disable=no-member
+            ft = frame_times[fi]
+            raw = frames[ft]
+            # Draw feature matches and FoE if available for this frame
+            if frame_features is not None and ft in frame_features:
+                p0f, p1f = frame_features[ft]
+                disp = cv2.cvtColor(raw, cv2.COLOR_GRAY2BGR) if raw.ndim == 2 else raw.copy()  # pylint: disable=no-member
+                sx = _FRAME_W / raw.shape[1]
+                sy = _FRAME_H / raw.shape[0]
+                for pt0, pt1 in zip(p0f, p1f):
+                    x0i, y0i = int(pt0[0] * sx), int(pt0[1] * sy)
+                    x1i, y1i = int(pt1[0] * sx), int(pt1[1] * sy)
+                    cv2.line(disp, (x0i, y0i), (x1i, y1i), (0, 200, 0), 1)   # pylint: disable=no-member
+                    cv2.circle(disp, (x1i, y1i), 2, (0, 0, 255), -1)          # pylint: disable=no-member
+                if frame_foe is not None and ft in frame_foe:
+                    fx, fy = frame_foe[ft]
+                    fxi, fyi = int(fx * sx), int(fy * sy)
+                    cv2.circle(disp, (fxi, fyi), 10, (0, 255, 255), 2)        # pylint: disable=no-member
+                    cv2.line(disp, (fxi - 14, fyi), (fxi + 14, fyi), (0, 255, 255), 2)  # pylint: disable=no-member
+                    cv2.line(disp, (fxi, fyi - 14), (fxi, fyi + 14), (0, 255, 255), 2)  # pylint: disable=no-member
+                frame_img.set_data(cv2.resize(disp, (_FRAME_W, _FRAME_H)))    # pylint: disable=no-member
+            else:
+                frame_img.set_data(cv2.resize(raw, (_FRAME_W, _FRAME_H)))     # pylint: disable=no-member
+
+        # ── Update shift-per-axis bar charts ──────────────────────────────────
+        if frames_available:
+            for a, bar_gt, bar_vo, ci in _shift_bar_axes:
+                gt_val = float(gt_shift[ci]) if gt_shift is not None else 0.0
+                vo_val = float(vo_shift[ci]) if vo_shift is not None else 0.0
+                bar_gt[0].set_height(gt_val)
+                bar_vo[0].set_height(vo_val)
+                a.set_ylim(-0.2, 0.2)
 
         # ── Build info text ───────────────────────────────────────────────────
         def f3(v):
@@ -295,6 +317,13 @@ def plot_trajectory_with_time_slider(
 
         def f3s(v):
             return f'[{v[0]:+.3f},{v[1]:+.3f},{v[2]:+.3f}]'
+
+        def fdir(v):
+            n = np.linalg.norm(v)
+            if n < 1e-9:
+                return '[  0.000, 0.000, 0.000]'
+            d = v / n
+            return f'[{d[0]:+.3f},{d[1]:+.3f},{d[2]:+.3f}]'
 
         traj_lbl = trajectory_label[:18].ljust(18)
         lines = [f't = {t:.2f} s', '']
@@ -308,8 +337,8 @@ def plot_trajectory_with_time_slider(
         if gt_pos is not None:
             lines += ['─ GT ─────────────────']
             lines += [f'Pos  {f3(gt_pos)}']
-            lines += [f'Vel  |v|={gt_vel_cur:.3f} m/s' if gt_vel_cur is not None else 'Vel  N/A']
             lines += [f'Shft {f3s(gt_shift)}']
+            lines += [f'Dir  {fdir(gt_shift)}']
             traj_err = np.linalg.norm(pos[:3] - gt_pos[:3])
             lines += [f'ErrP {traj_err:.3f} m']
             lines += ['']
@@ -323,6 +352,7 @@ def plot_trajectory_with_time_slider(
             else:
                 lines += ['Vel  N/A']
             lines += [f'Shft {f3s(ukf_shift)}']
+            lines += [f'Dir  {fdir(ukf_shift)}']
             if gt_pos is not None:
                 ukf_err = np.linalg.norm(ukf_pos[:3] - gt_pos[:3])
                 lines += [f'ErrP {ukf_err:.3f} m']
@@ -410,7 +440,7 @@ def display_frame_window(frame, p0=None, p1=None, window_name="Current Frame",
         for pt in p1:
             cv2.circle(display_frame, tuple(pt.astype(int)), 3, (255, 255, 0), -1)  # pylint: disable=no-member
 
-    display_frame = cv2.resize(display_frame, (0, 0), fx=3, fy=3)  # pylint: disable=no-member
+    display_frame = cv2.resize(display_frame, (0, 0), fx=1, fy=1)  # pylint: disable=no-member
     cv2.imshow(window_name, display_frame)  # pylint: disable=no-member
     return cv2.waitKey(wait_key)  # pylint: disable=no-member
 

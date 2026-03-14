@@ -1,3 +1,4 @@
+import glob
 import yaml
 import os
 import numpy as np
@@ -21,39 +22,44 @@ class ConfigManager:
         with open(filepath, "r", encoding="utf-8") as f:
             return yaml.safe_load(f)
     
+    def _find_file(self, prefix: str) -> str | None:
+        """Return the first file in calib_dir whose name starts with *prefix*."""
+        matches = glob.glob(os.path.join(self.calib_dir, prefix + "*.yaml"))
+        return matches[0] if matches else None
+
     def load_all_configs(self):
         """
         Load all calibration YAML files from the calibration directory.
-        
+        Files are discovered by prefix so the same code works for both
+        the DAVIS and Snapdragon calibration folders.
+
         Returns:
         --------
-        config : dict
-            Dictionary containing all calibration data with keys:
-            - 'imu': IMU calibration parameters
-            - 'camera': Camera calibration parameters
-            - 'camchain': Camera-IMU transformation chain
-            - 'target': Calibration target parameters
+        config : dict with keys 'imu', 'camera', 'camchain', 'target'
         """
         config = {}
-        
-        # Load IMU calibration
-        imu_file = os.path.join(self.calib_dir, "imu-..outdoor_forward_calib_davis_imu.yaml")
-        if os.path.exists(imu_file):
-            imu_data = self.load_yaml(imu_file)
-            config['imu'] = imu_data.get('imu0', {})
-        
-        # Load camera-IMU chain calibration
-        camchain_file = os.path.join(self.calib_dir, "camchain-imucam-..outdoor_forward_calib_davis_imu.yaml")
-        if os.path.exists(camchain_file):
+
+        # IMU calibration  (imu-*.yaml)
+        imu_file = self._find_file("imu-")
+        if imu_file:
+            config['imu'] = self.load_yaml(imu_file).get('imu0', {})
+        else:
+            raise FileNotFoundError(f"No imu-*.yaml found in {self.calib_dir}")
+
+        # Camera-IMU chain  (camchain-imucam-*.yaml  — contains T_cam_imu)
+        camchain_file = self._find_file("camchain-imucam-")
+        if camchain_file:
             camchain_data = self.load_yaml(camchain_file)
             config['camchain'] = camchain_data
-            config['camera'] = camchain_data.get('cam0', {})
-        
-        # Load calibration target parameters
+            config['camera']   = camchain_data.get('cam0', {})
+        else:
+            raise FileNotFoundError(f"No camchain-imucam-*.yaml found in {self.calib_dir}")
+
+        # Calibration target  (optional)
         target_file = os.path.join(self.calib_dir, "target.yaml")
         if os.path.exists(target_file):
             config['target'] = self.load_yaml(target_file)
-        
+
         return config
     
     def get_camera_matrix(self):

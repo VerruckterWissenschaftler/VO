@@ -133,11 +133,15 @@ def ORB_feature_matching(frame1, frame2, max_features=2000):
     return (pts1, pts2)
 
 
-def SIFT_feature_matching(frame1, frame2, max_features=2000, match_ratio=0.75, use_flann=True):
+def SIFT_feature_matching(frame1, frame2, max_features=200, match_ratio=0.5, use_flann=True):
     """SIFT with Lowe's ratio test. Active default matcher."""
+    max_features = 1000
+    mask = np.zeros_like(frame1)
+    w, h = frame1.shape[1], frame1.shape[0]
+    mask[:, :] = 255
     sift = cv2.SIFT_create(nfeatures=max_features)  # pylint: disable=no-member
-    kp1, des1 = sift.detectAndCompute(frame1, None)
-    kp2, des2 = sift.detectAndCompute(frame2, None)
+    kp1, des1 = sift.detectAndCompute(frame1, mask)
+    kp2, des2 = sift.detectAndCompute(frame2, mask)
 
     if des1 is None or des2 is None or len(kp1) < 2 or len(kp2) < 2:
         return None
@@ -169,8 +173,9 @@ def get_matcher(name: str = "sift"):
 
     Supported names: 'sift', 'orb', 'lk', 'lightglue', 'loftr'
 
-    sift / orb / lk  →  StatefulTracker  (detect once, track via LK until
-                         point count drops below threshold, then re-detect)
+    sift  → SIFT_feature_matching  (detect + describe + FLANN match every frame pair)
+    orb   → ORB_feature_matching   (detect + describe + BF match every frame pair)
+    lk    → StatefulTracker        (Shi-Tomasi detect once, then LK tracking)
     lightglue / loftr → GPU descriptor matchers (detect on every frame pair)
 
     The returned callable has signature:
@@ -178,9 +183,9 @@ def get_matcher(name: str = "sift"):
     """
     name_lower = name.lower()
     if name_lower == "sift":
-        return StatefulTracker(detector="sift", max_features=1000, min_tracked=200)
+        return SIFT_feature_matching
     if name_lower == "orb":
-        return StatefulTracker(detector="orb", max_features=2000, min_tracked=200)
+        return ORB_feature_matching
     if name_lower == "lk":
         return StatefulTracker(detector="shi-tomasi", max_features=1000, min_tracked=200)
     raise ValueError(f"Unknown matcher '{name}'. Choose from: sift, orb, lk, lightglue, loftr")

@@ -24,11 +24,14 @@ class VOEstimator:
 
         self.use_imu      = params.get("use_imu", True)
         self.use_vo       = params.get("use_vo", True)
+        self.use_ukf      = params.get("use_ukf", True)
+        self.use_foe      = params.get("use_foe", False)
         self.debug_ukf    = params.get("debug_ukf", False)
         self.use_gt_imu   = params.get("use_gt_imu", False)
         start_time        = params.get("start_time", None)
         duration          = params.get("duration", float("inf"))
         self.show_frames  = params.get("show_frames", False)
+        self.show_plots   = params.get("show_plots", True)
         self.matcher_name = params.get("matcher", "sift")
         self.init_height  = params.get("init_height", None)
 
@@ -66,7 +69,6 @@ class VOEstimator:
             gyro_noise_density=imu_params['gyroscope_noise_density'],
             gyro_random_walk=imu_params['gyroscope_random_walk'],
             meas_noise_vo=0.5,
-            meas_noise_gyro=1e-3,
             vel_decay_rate=2.0,
             log_path=os.path.join(dataset_path, "ukf_accel_log.csv"),
         )
@@ -76,12 +78,15 @@ class VOEstimator:
         self.ukf_positions    = {}  # timestamp → UKF position (3,)
         self.ukf_velocities   = {}  # timestamp → UKF velocity [vx,vy,vz] m/s
         self.ukf_orientations = {}  # timestamp → [roll, pitch, yaw] radians
+        self.vo_positions     = {}  # timestamp → raw VO cumulative position (3,)
 
         self.gt_positions_frames    = {}  # timestamp → GT position (3,)
         self.gt_orientations_frames = {}  # timestamp → GT quaternion [x,y,z,w]
 
-        # Camera frames and IMU accel log (for plotter side-panels)
-        self.frames:   dict = {}   # timestamp → undistorted frame
+        # Camera frames, feature matches, FoE, and IMU accel log (for plotter side-panels)
+        self.frames:         dict = {}   # timestamp → undistorted frame
+        self.frame_features: dict = {}   # timestamp → (p0, p1) matched keypoints
+        self.frame_foe:      dict = {}   # timestamp → (fx, fy) focus of expansion (image px)
         self._imu_ts:  list = []   # IMU absolute timestamps
         self._imu_acc: list = []   # IMU body-frame accelerations (3,)
 
@@ -134,19 +139,21 @@ class VOEstimator:
     def setup_camera(self):
         self.camera_matrix = self.config_manager.get_camera_matrix()
         self.dist_coeffs   = self.config_manager.get_distortion_coeffs()
+        # Precompute undistort maps — reused on every frame
+        first_img_row = self.data_manager.image_reader.df.iloc[0]
+        h = int(first_img_row["height"])
+        w = int(first_img_row["width"])
+        self._undistort_map1, self._undistort_map2 = cv2.fisheye.initUndistortRectifyMap(  # pylint: disable=no-member
+            self.camera_matrix, self.dist_coeffs, np.eye(3),
+            self.camera_matrix, (w, h), cv2.CV_16SC2,
+        )
 
     # ------------------------------------------------------------------
     # Image processing
     # ------------------------------------------------------------------
 
     def undistort_image(self, image):
-        K   = self.camera_matrix
-        D   = self.dist_coeffs
-        DIM = (image.shape[1], image.shape[0])
-        map1, map2 = cv2.fisheye.initUndistortRectifyMap(  # pylint: disable=no-member
-            K, D, np.eye(3), K, DIM, cv2.CV_16SC2
-        )
-        return cv2.remap(image, map1, map2,  # pylint: disable=no-member
+        return cv2.remap(image, self._undistort_map1, self._undistort_map2,  # pylint: disable=no-member
                          interpolation=cv2.INTER_LINEAR,
                          borderMode=cv2.BORDER_CONSTANT)
 
@@ -164,6 +171,71 @@ class VOEstimator:
         )
         return E, mask, x0, x1
 
+    @staticmethod
+    def compute_foe(p0: np.ndarray, p1: np.ndarray,
+                    ransac_iters: int = 200,
+                    inlier_threshold: float = 5.0) -> np.ndarray | None:
+        """
+        RANSAC-based Focus of Expansion from optical flow vectors.
+
+        Each iteration samples 2 flow lines, computes their intersection as
+        the FoE candidate, counts inliers (flow lines whose perpendicular
+        distance to the candidate is < inlier_threshold px), then refits
+        with all inliers via least-squares.
+
+        Returns (fx, fy) in image pixels, or None if underdetermined.
+        """
+        p0 = p0.reshape(-1, 2).astype(np.float64)
+        p1 = p1.reshape(-1, 2).astype(np.float64)
+        d     = p1 - p0
+        norms = np.linalg.norm(d, axis=1)
+        good  = norms > 1e-6
+        if good.sum() < 4:
+            return None
+        p0 = p0[good]
+        d  = d[good] / norms[good, None]   # unit flow directions
+        n  = len(p0)
+
+        best_foe      = None
+        best_n_inliers = 0
+
+        rng = np.random.default_rng()
+        for _ in range(ransac_iters):
+            i, j = rng.choice(n, 2, replace=False)
+            # Intersect two lines: p0[i] + t*d[i] = p0[j] + s*d[j]
+            # [d[i] | -d[j]] [t, s]^T = p0[j] - p0[i]
+            A = np.array([[d[i, 0], -d[j, 0]],
+                          [d[i, 1], -d[j, 1]]])
+            det = A[0, 0] * A[1, 1] - A[0, 1] * A[1, 0]
+            if abs(det) < 1e-8:
+                continue   # parallel lines
+            b   = p0[j] - p0[i]
+            t   = (b[0] * A[1, 1] - b[1] * A[0, 1]) / det
+            foe = p0[i] + t * d[i]
+
+            # Inlier test: perpendicular distance = |2D cross product|
+            diff    = foe - p0                                   # (N, 2)
+            cross   = diff[:, 0] * d[:, 1] - diff[:, 1] * d[:, 0]
+            n_inliers = int(np.sum(np.abs(cross) < inlier_threshold))
+
+            if n_inliers > best_n_inliers:
+                best_n_inliers = n_inliers
+                best_foe       = foe
+
+        if best_foe is None or best_n_inliers < 4:
+            return None
+
+        # Refit with all inliers via least-squares
+        diff  = best_foe - p0
+        cross = diff[:, 0] * d[:, 1] - diff[:, 1] * d[:, 0]
+        mask  = np.abs(cross) < inlier_threshold
+        if mask.sum() < 4:
+            return None
+        normals = np.stack([-d[mask, 1], d[mask, 0]], axis=1)   # (M, 2)
+        b_vec   = (normals * p0[mask]).sum(axis=1)
+        result, _, _, _ = np.linalg.lstsq(normals, b_vec, rcond=None)
+        return result  # (fx, fy)
+
     def estimate_pose(self, p0_good, p1_good):
         E, mask, x0, x1 = self.derive_essential_matrix(p0_good, p1_good)
 
@@ -175,13 +247,12 @@ class VOEstimator:
             self.logger.debug("Low inlier count (%d) for pose estimation.", inlier_count)
             return np.zeros(3)
 
-        # Use UKF's Rodrigues-integrated orientation for both t-sign and world-frame rotation
         R_curr = self.ukf.imu_orientation
         try:
             _, _, t, _ = cv2.recoverPose(E, x1, x0, focal=1.0, pp=(0, 0))  # pylint: disable=no-member
         except cv2.error:  # pylint: disable=no-member
             return np.zeros(3)
-
+        t = np.array([t[2, 0], t[0, 0], -t[1, 0]])  # Convert from camera frame to world frame
         return R_curr @ np.array(t).flatten()
 
     # ------------------------------------------------------------------
@@ -231,7 +302,8 @@ class VOEstimator:
                 idx = int(np.argmin(np.abs(self._gt_acc_times - current_time)))
                 gt_accel_world = self._gt_acc[idx].copy()
 
-        self.ukf.feed_imu(omega, a_body, dt, gt_orientation=gt_R, gt_accel_world=gt_accel_world)
+        self.ukf.feed_imu(omega, a_body, dt, gt_orientation=gt_R,
+                          gt_accel_world=gt_accel_world, update_filter=self.use_ukf)
 
     # ------------------------------------------------------------------
     # Per-frame update
@@ -260,12 +332,27 @@ class VOEstimator:
             return
 
         p0_good, p1_good = tracked
+        p0_reshape = p0_good.reshape(-1, 2)
+        p1_reshape = p1_good.reshape(-1, 2)
+        mask = (np.linalg.norm(p0_reshape - p1_reshape, axis=1) > 10).flatten()
+        print(sum(mask) / len(mask), "good matches after geometric filter")
+        p0_good = p0_good[mask]
+        p1_good = p1_good[mask]
         self.p0 = p1_good.reshape(-1, 1, 2)
+        if event_time is not None:
+            self.frame_features[event_time] = (
+                p0_good.reshape(-1, 2), p1_good.reshape(-1, 2)
+            )
+            if self.use_foe:
+                foe = self.compute_foe(p0_good, p1_good)
+                if foe is not None:
+                    self.frame_foe[event_time] = foe
 
         shift = self.estimate_pose(p0_good, p1_good)
         shift /= 1e1
         self._cumulative_position = self._cumulative_position + shift
-        self.ukf.vo_update(self._cumulative_position)
+        if self.use_ukf:
+            self.ukf.vo_update(self._cumulative_position)
 
         if self.show_frames:
             pos  = self.ukf.get_position()
@@ -314,6 +401,10 @@ class VOEstimator:
         ukf_euler       = np.array([self.ukf_orientations.get(t, np.zeros(3)) for t in ukf_times]) \
                           if ukf_times else np.empty((0, 3))
 
+        vo_times      = sorted(self.vo_positions.keys())
+        vo_positions  = np.array([self.vo_positions[t] for t in vo_times]) \
+                        if vo_times else np.empty((0, 3))
+
         gt_frame_times = sorted(self.gt_positions_frames.keys())
         gt_frame_positions = np.array([self.gt_positions_frames[t] for t in gt_frame_times]) \
                              if gt_frame_times else np.empty((0, 3))
@@ -322,6 +413,7 @@ class VOEstimator:
 
         return (
             ukf_times, ukf_positions, ukf_velocities, ukf_euler,
+            vo_times, vo_positions,
             gt_frame_times, gt_frame_positions, gt_frame_orientations,
         )
 
@@ -341,10 +433,16 @@ class VOEstimator:
 
                 if event_type == "image":
                     self.update(event["data"]["image"], event_time=event_time)
-                    # Snapshot UKF state at every image frame
-                    self.ukf_positions[event_time]    = self.ukf.get_position()
-                    self.ukf_velocities[event_time]   = self.ukf.get_velocity()
-                    self.ukf_orientations[event_time] = self.ukf.x[6:9].copy()
+                    # Snapshot raw VO cumulative position
+                    self.vo_positions[event_time] = self._cumulative_position.copy()
+                    if self.use_ukf:
+                        self.ukf_positions[event_time]    = self.ukf.get_position()
+                        self.ukf_velocities[event_time]   = self.ukf.get_velocity()
+                        self.ukf_orientations[event_time] = self.ukf.x[6:9].copy()
+                    else:
+                        self.ukf_positions[event_time]    = self._cumulative_position.copy()
+                        self.ukf_velocities[event_time]   = np.zeros(3)
+                        self.ukf_orientations[event_time] = np.zeros(3)
                     # Nearest GT at this frame
                     gt_p, gt_q = self._lookup_gt_at(event_time)
                     self.gt_positions_frames[event_time]    = gt_p

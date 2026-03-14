@@ -85,18 +85,19 @@ def _residual_ang(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 class UKF:
     """
-    12-state UKF for fused IMU + VO navigation, built on filterpy.
+    9-state UKF for fused IMU + VO navigation, built on filterpy.
 
-    State vector: x = [px, py, pz,  vx, vy, vz,  roll, pitch, yaw,  wx, wy, wz]
-                       0   1   2     3   4   5     6     7      8     9   10  11
+    State vector: x = [px, py, pz,  vx, vy, vz,  roll, pitch, yaw]
+                       0   1   2     3   4   5     6     7      8
+
+    Angular velocity (omega) and linear acceleration are external inputs, not state.
 
     Data ingestion:
       append_accelerometer(a_body) — store latest IMU linear acceleration.
       append_orientation(R)        — measurement update: IMU orientation → angle states.
 
     Predict / update:
-      predict(dt)        — propagate state using stored accelerometer + state omega.
-      gyro_update(omega) — high-rate gyro measurement for omega states [9:12].
+      predict(omega, dt) — propagate state using stored accelerometer + provided omega.
       vo_update(pos)     — sparse VO position measurement for pos states [0:3].
     """
 
@@ -107,7 +108,6 @@ class UKF:
         gyro_noise_density:     float = 0.05,   # rad/s/√Hz — from IMU calibration
         gyro_random_walk:       float = 4e-5,   # rad/s√Hz  — gyro bias instability
         meas_noise_vo:          float = 0.5,
-        meas_noise_gyro:        float = 1e-3,
         meas_noise_orientation: float = 1e-2,
         initial_uncertainty:    float = 1e-3,
         vel_decay_rate:         float = 2.0,
@@ -116,7 +116,6 @@ class UKF:
     ):
         self.vel_decay_rate          = vel_decay_rate
         self._meas_noise_vo          = meas_noise_vo
-        self._meas_noise_gyro        = meas_noise_gyro
         self._meas_noise_orientation = meas_noise_orientation
         self.initialized = False
 
@@ -126,11 +125,13 @@ class UKF:
         self._Ng  = gyro_noise_density  ** 2   # rad²/s — gyro white noise PSD
         self._Nbg = gyro_random_walk    ** 2   # rad²/s³ — gyro bias random walk PSD
 
-        n = 12
-        self._pos   = slice(0, 3)
-        self._vel   = slice(3, 6)
-        self._ang   = slice(6, 9)
-        self._omega = slice(9, 12)
+        n = 9
+        self._pos = slice(0, 3)
+        self._vel = slice(3, 6)
+        self._ang = slice(6, 9)
+
+        # External inputs — set before each predict call
+        self._current_omega = np.zeros(3)
 
         points = MerweScaledSigmaPoints(
             n=n, alpha=1e-3, beta=2.0, kappa=0.0,
@@ -223,14 +224,14 @@ class UKF:
 
     def feed_imu(self, omega: np.ndarray, accel_body: np.ndarray, dt: float,
                  gt_orientation: np.ndarray | None = None,
-                 gt_accel_world: np.ndarray | None = None) -> None:
+                 gt_accel_world: np.ndarray | None = None,
+                 update_filter: bool = True) -> None:
         """
         Full IMU step — call once per IMU event.
 
-        1. Rodrigues-integrates omega → updates internal _imu_orientation.
-        2. Calls predict(dt) with the stored accel.
-        3. Calls gyro_update(omega) to correct angular-velocity states.
-        4. Calls append_orientation() with _imu_orientation (or gt_orientation if provided).
+        1. Rodrigues-integrates omega → updates internal _imu_orientation (always).
+        2. If update_filter=True: predict(omega, dt) + append_orientation().
+           If update_filter=False: orientation-only mode — UKF state is not touched.
 
         Parameters
         ----------
@@ -241,11 +242,13 @@ class UKF:
                          orientation measurement update (use_gt_imu mode)
         gt_accel_world : optional GT world-frame acceleration (m/s²); when provided it is
                          used directly in _fx, bypassing IMU accel rotation and bias removal
+        update_filter  : if False, only Rodrigues orientation is updated; UKF predict/update
+                         steps are skipped (use when use_ukf=False)
         """
         if not self.initialized or dt <= 0 or dt > 0.5:
             return
 
-        # Rodrigues orientation integration
+        # Rodrigues orientation integration (always runs)
         angle = np.linalg.norm(omega) * dt
         if angle >= 1e-8:
             axis = omega / np.linalg.norm(omega)
@@ -261,18 +264,19 @@ class UKF:
             if self._imu_update_count % 100 == 0:
                 U, _, Vt = np.linalg.svd(self._imu_orientation)
                 self._imu_orientation = U @ Vt
-        
+
+        if not update_filter:
+            return
+
         # When GT accel is available, store it (already world-frame) in the window;
         # _fx will skip rotation. Otherwise store raw body-frame IMU accel.
         self._gt_accel_world = gt_accel_world
-        self.append_accelerometer(gt_accel_world if gt_accel_world is not None else accel_body)
-        self.predict(dt)
+        self.predict(omega, dt)
         self._log_cumtime += dt
         if self._log_writer is not None:
             a = self._world_accel()
             self._log_writer.writerow([f"{self._log_cumtime:.6f}",
                                        f"{a[0]:.6f}", f"{a[1]:.6f}", f"{a[2]:.6f}"])
-        self.gyro_update(omega)
         self.append_orientation(gt_orientation if gt_orientation is not None
                                 else self._imu_orientation)
 
@@ -281,10 +285,13 @@ class UKF:
         """Rodrigues-integrated IMU orientation (3×3 rotation matrix)."""
         return self._imu_orientation
 
-    def predict(self, dt: float) -> None:
+    def predict(self, omega: np.ndarray, dt: float) -> None:
         """
-        Propagate state using stored accelerometer + state angular velocity.
+        Propagate state using stored accelerometer and provided angular velocity.
         Call append_accelerometer() before this each IMU step.
+
+        omega  : angular velocity [wx, wy, wz] rad/s (body frame) — used directly in _fx
+                 to integrate Euler angles; not stored in state.
 
         Q is rebuilt each call via Van Loan discretization so noise covariance
         scales correctly with the actual time step:
@@ -294,17 +301,16 @@ class UKF:
 
           Angle block (from gyro white noise Ng):
             Q_aa = Ng·dt
-
-          Angular-velocity block (from gyro bias random walk Nbg):
-            Q_ww = Nbg·dt
         """
         if not self.initialized or dt <= 0 or dt > 0.5:
             return
 
+        self._current_omega = omega.copy()
+
         dt2 = dt * dt
         dt3 = dt2 * dt
 
-        Q = np.zeros((12, 12))
+        Q = np.zeros((9, 9))
         for i in range(3):
             # position states [0,1,2]
             Q[i,   i  ] = self._Na * dt3 / 3.0   # pos–pos
@@ -314,17 +320,9 @@ class UKF:
             Q[i+3, i+3] = self._Na * dt           # vel–vel
             # angle states [6,7,8]
             Q[i+6, i+6] = self._Ng  * dt          # ang–ang (gyro white noise)
-            # angular-velocity states [9,10,11]
-            Q[i+9, i+9] = self._Nbg * dt          # omega–omega (gyro bias walk)
 
         self._ukf.Q = Q
         self._ukf.predict(dt=dt)
-
-    def gyro_update(self, omega_meas: np.ndarray) -> None:
-        """High-rate measurement update: gyro → omega states [9:12]."""
-        if not self.initialized:
-            return
-        self._ukf.update(omega_meas, hx=self._hx_omega, R=np.eye(3) * self._meas_noise_gyro)
 
     def vo_update(self, position: np.ndarray) -> None:
         """Sparse measurement update: VO position → position states [0:3]."""
@@ -362,7 +360,7 @@ class UKF:
         if self._gt_accel_world is not None:
             return self._accel_filtered()
         roll, pitch, yaw = self._ukf.x[self._ang]
-        R = _euler_zyx_to_rotation(roll, pitch, yaw)
+        # R = _euler_zyx_to_rotation(roll, pitch, yaw)
         # a = R @ self._accel_filtered()
         a = self._accel_filtered()
         # a[0] -= -0.2372
@@ -400,19 +398,16 @@ class UKF:
         x_new = x.copy()
 
         roll, pitch, yaw = x[6], x[7], x[8]
-        wx, wy, wz       = x[9], x[10], x[11]
+        wx, wy, wz       = self._current_omega  # external input, not state
 
         # World-frame linear acceleration (GT override or IMU-derived)
         if self._gt_accel_world is not None:
             # Window already holds world-frame GT accel — use filtered value directly
             a_world = self._accel_filtered()
         else:
-            R = _euler_zyx_to_rotation(roll, pitch, yaw)
+            # R = _euler_zyx_to_rotation(roll, pitch, yaw)
             # a_world = R @ self._accel_filtered()
             a_world = self._accel_filtered()
-            # a_world[0] -= -0.2372
-            # a_world[1] -= -1.5710
-            # a_world[2] -= 9.7817
         # Position integration
         x_new[0:3] = x[0:3] + x[3:6] * dt
 
@@ -421,7 +416,7 @@ class UKF:
         decay = 1
         x_new[3:6] = x[3:6] * decay + a_world * dt
 
-        # Euler angle integration from state angular velocity
+        # Euler angle integration from IMU angular velocity
         cr, sr = np.cos(roll), np.sin(roll)
         cp = np.cos(pitch)
         tp = np.tan(pitch) if abs(cp) > 1e-6 else np.sign(np.sin(pitch)) * 1e6
@@ -430,9 +425,6 @@ class UKF:
         x_new[7] = _wrap_angle(pitch + (wy * cr - wz * sr) * dt)
         x_new[8] = _wrap_angle(yaw   + (wy * sr + wz * cr) / max(abs(cp), 1e-6) * np.sign(cp) * dt)
 
-        # Angular velocity: random walk (gyro_update corrects it)
-        x_new[9:12] = x[9:12]
-
         return x_new
 
     def _hx_pos(self, x: np.ndarray) -> np.ndarray:
@@ -440,6 +432,3 @@ class UKF:
 
     def _hx_ang(self, x: np.ndarray) -> np.ndarray:
         return x[self._ang]
-
-    def _hx_omega(self, x: np.ndarray) -> np.ndarray:
-        return x[self._omega]

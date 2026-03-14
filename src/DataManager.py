@@ -146,9 +146,7 @@ class DataManager:
                     'Time': row['Time'],
                     'height': int(row['height']),
                     'width': int(row['width']),
-                    'encoding': row['encoding'],
-                    'data': row['data'],  # Raw data string
-                    '_row_index': idx  # Store index for lazy loading
+                    '_row_index': idx  # position in filtered df for lazy loading
                 }
             })
         
